@@ -35,7 +35,7 @@ async def analyze_market(symbol: str, interval: str = "15m"):
                 async with session.get(url) as resp:
                     data = await resp.json()
                     price = data['rates']['USD']
-                    return f"📊 <b>Анализ EUR/USD</b>\n\nЦена: <code>{price:.4f}</code>\n\n<b>Сигнал: НАБЛЮДЕНИЕ</b>\nДля Форекса нужен брокер, API бесплатно дает только текущую цену. Тренд определи вручную по графику.", parse_mode="HTML"
+                    return f"📊 <b>Анализ EUR/USD</b>\n\nЦена: <code>{price:.4f}</code>\n\n<b>Сигнал: НАБЛЮДЕНИЕ</b>\nДля Форекса нужен брокер, API бесплатно дает только текущую цену. Тренд определи вручную по графику."
         except Exception as e:
             return f"❌ Ошибка: {e}"
 
