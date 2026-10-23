@@ -17,6 +17,7 @@ def get_menu():
     keyboard = [
         [InlineKeyboardButton("📈 Анализ BTC/USDT", callback_data="btc")],
         [InlineKeyboardButton("📈 Анализ ETH/USDT", callback_data="eth")],
+        [InlineKeyboardButton("📈 Анализ SOL/USDT", callback_data="sol")],
         [InlineKeyboardButton("📈 Анализ EUR/USD (Forex)", callback_data="eur")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -24,93 +25,109 @@ def get_menu():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    await update.message.reply_text("👋 Привет! Я бот для анализа рынка.\nВыбери актив для анализа:", reply_markup=get_menu())
+    await update.message.reply_text(
+        "👋 <b>Трейдинг-терминал активирован.</b>\n\n"
+        "Я анализирую рынок по тренду (EMA) и волатильности (ATR).\n"
+        "Для каждой сделки я рассчитываю: Точку входа, Стоп-Лосс и Тейк-Профит.\n\n"
+        "Выбери актив:", 
+        reply_markup=get_menu(), 
+        parse_mode="HTML"
+    )
 
 async def analyze_market(symbol: str, interval: str = "15m"):
-    # === ФОРЕКС (EUR/USD) ===
     if symbol == "EURUSD":
-        url = "https://api.frankfurter.app/latest?from=EUR&to=USD"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    data = await resp.json()
-                    price = data['rates']['USD']
-                    return f"📊 <b>Анализ EUR/USD</b>\n\nЦена: <code>{price:.4f}</code>\n\n<b>Сигнал: НАБЛЮДЕНИЕ</b>\nДля Форекса нужен брокер, API бесплатно дает только текущую цену."
-        except Exception as e:
-            return f"❌ Ошибка Форекс API: {e}"
+        return "📊 <b>Анализ EUR/USD</b>\n\nДля Форекса бесплатные API не дают историю для расчетов. Используй крипту для теста."
 
-    # === КРИПТА (Bybit) ===
-    # Bybit принимает интервалы: 15, 60, 240, D
-    bybit_interval = "15"
-    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_interval}&limit=100"
+    # Запрос к Bybit (100 свечей по 15 минут)
+    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval=15&limit=100"
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    return f"❌ Ошибка Bybit API: {resp.status}"
+                    return f"❌ Ошибка API: {resp.status}"
                 data = await resp.json()
                 if data.get("retCode") != 0:
-                    return f"❌ Ошибка данных Bybit: {data.get('retMsg')}"
+                    return f"❌ Ошибка Bybit: {data.get('retMsg')}"
                 
-                # Bybit отдает свечи в обратном порядке (сначала новые), переворачиваем
                 klines = data["result"]["list"]
                 klines.reverse()
     except Exception as e:
         return f"❌ Ошибка сети: {str(e)}"
 
-    # Закрывающие цены (в Bybit это 5-й элемент)
     closes = [float(candle[4]) for candle in klines]
+    highs = [float(candle[2]) for candle in klines]
+    lows = [float(candle[3]) for candle in klines]
     
-    # EMA
+    # 1. EMA (9 и 21)
     def calc_ema(prices, period):
         multiplier = 2 / (period + 1)
         ema = prices[0]
         for price in prices[1:]:
             ema = (price - ema) * multiplier + ema
         return ema
-
     ema9 = calc_ema(closes, 9)
     ema21 = calc_ema(closes, 21)
     
-    # RSI
+    # 2. RSI (14)
     def calc_rsi(prices, period=14):
         gains, losses = [], []
         for i in range(1, len(prices)):
             diff = prices[i] - prices[i-1]
             if diff >= 0:
-                gains.append(diff)
-                losses.append(0)
+                gains.append(diff); losses.append(0)
             else:
-                gains.append(0)
-                losses.append(abs(diff))
+                gains.append(0); losses.append(abs(diff))
         avg_gain = sum(gains[-period:]) / period
         avg_loss = sum(losses[-period:]) / period
         if avg_loss == 0: return 100
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
-
     rsi = calc_rsi(closes)
-    current_price = closes[-1]
-    
-    signal = "НЕТ СИГНАЛА"
-    confidence = 0
-    
-    if ema9 > ema21 and rsi < 70:
-        signal = "📈 ПОКУПКА (LONG)"
-        confidence = round(70 + (50 - rsi) if rsi < 50 else 65, 1)
-    elif ema9 < ema21 and rsi > 30:
-        signal = "📉 ПРОДАЖА (SHORT)"
-        confidence = round(70 + (rsi - 50) if rsi > 50 else 65, 1)
 
+    # 3. ATR (14) - для расчета стопов
+    def calc_atr(highs, lows, closes, period=14):
+        trs = []
+        for i in range(1, len(closes)):
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+            trs.append(tr)
+        return sum(trs[-period:]) / period
+    atr = calc_atr(highs, lows, closes)
+
+    current_price = closes[-1]
+    signal = "НЕТ СИГНАЛА"
+    entry, stop_loss, take_profit = 0, 0, 0
+    risk_reward = "1:2"
+    confidence = 0
+
+    # Логика: если тренд вверх и RSI не перекуплен
+    if ema9 > ema21 and rsi < 65:
+        signal = "🟢 ПОКУПКА (LONG)"
+        entry = current_price
+        stop_loss = entry - (atr * 1.5) # Стоп на 1.5 ATR ниже
+        take_profit = entry + (atr * 3.0) # Тейк на 3 ATR выше
+        confidence = round(70 + (50 - rsi) / 2, 1)
+    # Логика: если тренд вниз и RSI не перепродан
+    elif ema9 < ema21 and rsi > 35:
+        signal = "🔴 ПРОДАЖА (SHORT)"
+        entry = current_price
+        stop_loss = entry + (atr * 1.5) # Стоп на 1.5 ATR выше
+        take_profit = entry - (atr * 3.0) # Тейк на 3 ATR ниже
+        confidence = round(70 + (rsi - 50) / 2, 1)
+    else:
+        return f"📊 <b>Анализ {symbol}</b>\n\nЦена: <code>{current_price:.2f}</code>\nRSI: <code>{rsi:.1f}</code>\n\n⚖️ <b>Сигнала нет.</b>\nРынок в неопределенности (флэт). Ждем тренд."
+
+    # Форматируем текст
     text = (
-        f"📊 <b>Анализ {symbol} (15m)</b>\n\n"
-        f"Цена: <code>{current_price:.2f}</code>\n"
-        f"Тренд: {'Восходящий 🟢' if ema9 > ema21 else 'Нисходящий 🔴'}\n"
-        f"RSI (14): <code>{rsi:.1f}</code>\n\n"
-        f"<b>Сигнал: {signal}</b>\n"
+        f"📊 <b>Терминал: {symbol} (15m)</b>\n\n"
+        f"💰 Цена входа: <code>{entry:.4f}</code>\n"
+        f"📉 RSI: <code>{rsi:.1f}</code>\n\n"
+        f"<b>СИГНАЛ: {signal}</b>\n"
         f"Уверенность: {confidence}%\n\n"
-        f"<i>Анализ по алгоритму EMA+RSI. Не является финансовой рекомендацией.</i>"
+        f"🛑 <b>Стоп-лосс:</b> <code>{stop_loss:.4f}</code>\n"
+        f"🎯 <b>Тейк-профит:</b> <code>{take_profit:.4f}</code>\n"
+        f"⚖️ <b>Риск/Прибыль:</b> {risk_reward}\n\n"
+        f"<i>⚠️ Не является финансовой рекомендацией. Риск-менеджмент обязателен!</i>"
     )
     return text
 
@@ -121,9 +138,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
 
-    # Защита от быстрых повторных нажатий
     if context.user_data.get('is_analyzing'):
-        await query.answer("⏳ Подожди, анализ уже идет...", show_alert=True)
+        await query.answer("⏳ Подожди, идет расчет...", show_alert=True)
         return
     context.user_data['is_analyzing'] = True
 
@@ -136,11 +152,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⏳ Анализирую ETH/USDT...")
             res = await analyze_market("ETHUSDT")
             await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
+        elif query.data == "sol":
+            await query.edit_message_text("⏳ Анализирую SOL/USDT...")
+            res = await analyze_market("SOLUSDT")
+            await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
         elif query.data == "eur":
             res = await analyze_market("EURUSD")
             await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
     finally:
-        # Снимаем блокировку через 5 секунд
         await asyncio.sleep(5)
         context.user_data['is_analyzing'] = False
 
@@ -154,7 +173,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     
-    logging.info("🚀 Трейдинг-бот запущен!")
+    logging.info("🚀 Трейдинг-терминал запущен!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
