@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -26,31 +27,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Привет! Я бот для анализа рынка.\nВыбери актив для анализа:", reply_markup=get_menu())
 
 async def analyze_market(symbol: str, interval: str = "15m"):
-    # Binance API для крипты
+    # === ФОРЕКС (EUR/USD) ===
     if symbol == "EURUSD":
-        # Для Форекса используем другой бесплатный API (упрощенно)
         url = "https://api.frankfurter.app/latest?from=EUR&to=USD"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     data = await resp.json()
                     price = data['rates']['USD']
-                    return f"📊 <b>Анализ EUR/USD</b>\n\nЦена: <code>{price:.4f}</code>\n\n<b>Сигнал: НАБЛЮДЕНИЕ</b>\nДля Форекса нужен брокер, API бесплатно дает только текущую цену. Тренд определи вручную по графику."
+                    return f"📊 <b>Анализ EUR/USD</b>\n\nЦена: <code>{price:.4f}</code>\n\n<b>Сигнал: НАБЛЮДЕНИЕ</b>\nДля Форекса нужен брокер, API бесплатно дает только текущую цену."
         except Exception as e:
-            return f"❌ Ошибка: {e}"
+            return f"❌ Ошибка Форекс API: {e}"
 
-    # Для крипты (Binance)
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+    # === КРИПТА (Bybit) ===
+    # Bybit принимает интервалы: 15, 60, 240, D
+    bybit_interval = "15"
+    url = f"https://api.bybit.com/v5/market/kline?category=spot&symbol={symbol}&interval={bybit_interval}&limit=100"
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    return f"❌ Ошибка Binance API: {resp.status}"
+                    return f"❌ Ошибка Bybit API: {resp.status}"
                 data = await resp.json()
+                if data.get("retCode") != 0:
+                    return f"❌ Ошибка данных Bybit: {data.get('retMsg')}"
+                
+                # Bybit отдает свечи в обратном порядке (сначала новые), переворачиваем
+                klines = data["result"]["list"]
+                klines.reverse()
     except Exception as e:
         return f"❌ Ошибка сети: {str(e)}"
 
-    closes = [float(candle[4]) for candle in data]
+    # Закрывающие цены (в Bybit это 5-й элемент)
+    closes = [float(candle[4]) for candle in klines]
     
     # EMA
     def calc_ema(prices, period):
@@ -94,7 +104,7 @@ async def analyze_market(symbol: str, interval: str = "15m"):
         confidence = round(70 + (rsi - 50) if rsi > 50 else 65, 1)
 
     text = (
-        f"📊 <b>Анализ {symbol} ({interval})</b>\n\n"
+        f"📊 <b>Анализ {symbol} (15m)</b>\n\n"
         f"Цена: <code>{current_price:.2f}</code>\n"
         f"Тренд: {'Восходящий 🟢' if ema9 > ema21 else 'Нисходящий 🔴'}\n"
         f"RSI (14): <code>{rsi:.1f}</code>\n\n"
@@ -111,17 +121,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
 
-    if query.data == "btc":
-        await query.edit_message_text("⏳ Анализирую BTC/USDT...")
-        res = await analyze_market("BTCUSDT")
-        await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
-    elif query.data == "eth":
-        await query.edit_message_text("⏳ Анализирую ETH/USDT...")
-        res = await analyze_market("ETHUSDT")
-        await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
-    elif query.data == "eur":
-        res = await analyze_market("EURUSD")
-        await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
+    # Защита от быстрых повторных нажатий
+    if context.user_data.get('is_analyzing'):
+        await query.answer("⏳ Подожди, анализ уже идет...", show_alert=True)
+        return
+    context.user_data['is_analyzing'] = True
+
+    try:
+        if query.data == "btc":
+            await query.edit_message_text("⏳ Анализирую BTC/USDT...")
+            res = await analyze_market("BTCUSDT")
+            await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
+        elif query.data == "eth":
+            await query.edit_message_text("⏳ Анализирую ETH/USDT...")
+            res = await analyze_market("ETHUSDT")
+            await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
+        elif query.data == "eur":
+            res = await analyze_market("EURUSD")
+            await query.edit_message_text(res, parse_mode="HTML", reply_markup=get_menu())
+    finally:
+        # Снимаем блокировку через 5 секунд
+        await asyncio.sleep(5)
+        context.user_data['is_analyzing'] = False
 
 def main():
     if not BOT_TOKEN or not OWNER_ID:
